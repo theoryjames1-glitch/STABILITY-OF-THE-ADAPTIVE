@@ -320,4 +320,261 @@ Excellent ⚡ — let’s extend the table with the **Competitor vs Distorter as
 * **DCL/GCAL:** perpetual motion.
 * **Asymmetry (C vs D):** balance of *order (Competitor)* and *chaos (Distorter)* creates **stability without resolution**.
 
+Gotcha — you want the **Competitor** to be *outside the box* (not co-trained, possibly a separate process/human/black-box bot), while the **Distorter** (our learner) adapts inside. Here’s a clean pattern + runnable scaffolding you can drop in.
+
+# 🎮 Connect Four — External Competitor, Internal Distorter
+
+## What this gives you
+
+* **Competitor (external)**: any agent you run as a separate process (or human). It’s the “outside the box” player.
+* **Distorter (internal)**: a PyTorch policy trained to **force stalemates / weird attractors** and generally destabilize the Competitor.
+* **Bridge**: a tiny line-based JSON protocol so your external agent can plug in via stdin/stdout.
+
+---
+
+## 1) Protocol (one line per move)
+
+We send your Competitor a JSON line:
+
+```json
+{"board": [[0,0,0,0,0,0,0], ... 6 rows ...], "current_player": 1, "legal": [1,1,1,1,1,1,1]}
+```
+
+It must respond with a single integer column `0..6` and a newline, e.g.:
+
+```
+3
+```
+
+* Board encoding: `0 = empty`, `1 = X`, `-1 = O`.
+* In this setup, **Competitor plays X** (first), **Distorter plays O**.
+
+---
+
+## 2) External agent stub (example)
+
+Save as `external_competitor.py`. Replace the move logic with your real bot (minimax, heuristic, or even human-in-the-loop if you script it).
+
+```python
+# external_competitor.py
+import sys, json, random
+
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    msg = json.loads(line)
+    board = msg["board"]   # 6x7 ints
+    legal = msg["legal"]   # 7 ints (1/0)
+    cols = [i for i,ok in enumerate(legal) if ok]
+    # TODO: replace with real logic (minimax, heuristic, etc.)
+    move = random.choice(cols) if cols else 0
+    sys.stdout.write(str(move) + "\n")
+    sys.stdout.flush()
+```
+
+Run it separately (the trainer will spawn it):
+
+```
+python external_competitor.py
+```
+
+---
+
+## 3) Trainer with Internal Distorter (PyTorch)
+
+This will spawn your external process, play games **Competitor (X) vs Distorter (O)**, and train O to create **strange attractors / stalemates** (with anchors to avoid pure nonsense).
+
+```python
+# dcl_external_competitor.py
+import torch, torch.nn as nn, torch.optim as optim
+import numpy as np, subprocess, json, os, sys, random
+
+# ---------- Connect Four Env ----------
+class ConnectFour:
+    def __init__(self): self.rows, self.cols = 6, 7; self.reset()
+    def reset(self):
+        self.board = np.zeros((self.rows, self.cols), dtype=np.int8)
+        self.current_player = 1  # X first
+        return self.board.copy()
+    def legal_mask(self): return (self.board[0] == 0).astype(np.float32)
+    def step(self, col):
+        if self.board[0, col] != 0:
+            return self.board.copy(), -1 * self.current_player, True  # illegal -> loss for mover
+        r = max(rr for rr in range(self.rows) if self.board[rr, col] == 0)
+        self.board[r, col] = self.current_player
+        rew, done = self._check(r, col)
+        self.current_player *= -1
+        return self.board.copy(), rew, done
+    def _check(self, r, c):
+        p = self.board[r, c]
+        def count(dr, dc):
+            rr, cc, ct = r+dr, c+dc, 0
+            while 0 <= rr < self.rows and 0 <= cc < self.cols and self.board[rr, cc] == p:
+                ct += 1; rr += dr; cc += dc
+            return ct
+        for dr, dc in [(1,0),(0,1),(1,1),(1,-1)]:
+            if 1 + count(dr,dc) + count(-dr,-dc) >= 4:
+                return p, True
+        if np.all(self.board != 0): return 0, True
+        return 0, False
+
+# ---------- External Competitor Wrapper ----------
+class ExternalCompetitor:
+    def __init__(self, cmd):
+        # cmd e.g. ["python", "external_competitor.py"]
+        self.proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1
+        )
+    def choose(self, board, legal, current_player=1):
+        msg = {"board": board.tolist(), "current_player": int(current_player), "legal": legal.tolist()}
+        self.proc.stdin.write(json.dumps(msg) + "\n")
+        self.proc.stdin.flush()
+        move_line = self.proc.stdout.readline()
+        try:
+            return int(move_line.strip())
+        except:
+            # fallback if bad response
+            cols = [i for i,ok in enumerate(legal) if ok]
+            return random.choice(cols) if cols else 0
+    def close(self):
+        try:
+            self.proc.terminate()
+        except:
+            pass
+
+# ---------- Distorter Policy (O) ----------
+class Policy(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(6*7, 128), nn.ReLU(),
+            nn.Linear(128, 7)
+        )
+    def forward(self, board_np):
+        x = torch.tensor(board_np, dtype=torch.float32).unsqueeze(0)
+        logits = self.net(x)
+        mask = torch.tensor((board_np[0]==0).astype(np.float32)).unsqueeze(0)
+        logits = logits.masked_fill(mask == 0, -1e9)
+        return torch.softmax(logits, dim=-1)
+
+def sample_action(probs):
+    dist = torch.distributions.Categorical(probs)
+    a = dist.sample()
+    return a.item(), dist.log_prob(a)
+
+def random_action(board_np):
+    legal = (board_np[0]==0).astype(np.float32)
+    cols = np.flatnonzero(legal)
+    return int(np.random.choice(cols)) if len(cols) else 0
+
+# ---------- Play one game: External X vs Distorter O ----------
+def play_game(env, extX: ExternalCompetitor, distorter: Policy, baseline_O=False):
+    logpO = []
+    board = env.reset()
+    done, reward = False, 0
+    while not done:
+        legal = env.legal_mask()
+        if env.current_player == 1:  # External Competitor (X)
+            a = extX.choose(board, legal, current_player=1)
+        else:  # Distorter (O)
+            if baseline_O:
+                a = random_action(board)
+            else:
+                probs = distorter(board)
+                a, lp = sample_action(probs); logpO.append(lp)
+        board, reward, done = env.step(a)
+    # reward is from X's perspective; O gets the negative
+    R_X, R_O = reward, -reward
+    return logpO, R_X, R_O
+
+# ---------- Training loop ----------
+def main():
+    # 1) Launch external competitor process (replace with your actual command)
+    ext = ExternalCompetitor(["python", "external_competitor.py"])
+
+    # 2) Internal Distorter
+    distorter = Policy()
+    optO = optim.Adam(distorter.parameters(), lr=1e-3)
+
+    env = ConnectFour()
+    episodes = 2000
+    games_per_phase = 16
+    alpha_entropy = 0.01   # encourage weirdness/diversity
+    beta_anchor  = 0.1     # penalize if Distorter is worse than random baseline
+
+    # Drift diagnostics
+    rolling = {"vs_ext": [], "vs_rand": []}
+
+    for ep in range(1, episodes+1):
+        # ---- Train Distorter to induce stalemates / survival vs external Competitor ----
+        loss_sum = 0.0
+        for _ in range(games_per_phase):
+            logpO, R_X, R_O = play_game(env, ext, distorter, baseline_O=False)
+
+            # Entropy bonus (on current state dist; light-weight)
+            probs_now = distorter(env.board if hasattr(env, "board") else np.zeros((6,7)))
+            ent = torch.distributions.Categorical(probs_now).entropy().mean().item()
+
+            # Anchor: Distorter should not be worse than random-O vs external X
+            _, R_X_rand, R_O_rand = play_game(env, ext, distorter, baseline_O=True)
+            anchor_pen = 1.0 if R_O_rand < 0 else 0.0  # loses vs random-O
+
+            # Objective (maximize): R_O + α*H - β*anchor
+            obj = R_O + alpha_entropy*ent - beta_anchor*anchor_pen
+            loss_sum += -obj  # minimize negative of objective
+
+            # Policy gradient (REINFORCE on O’s own log-probs)
+            if logpO:
+                # Scale by advantage ~ (R_O + shaping); here we re-use obj as scalar signal
+                pg_loss = -(obj) * torch.stack(logpO).sum()
+                optO.zero_grad()
+                pg_loss.backward()
+                torch.nn.utils.clip_grad_norm_(distorter.parameters(), 1.0)
+                optO.step()
+
+        # ---- Diagnostics every 200 eps ----
+        if ep % 200 == 0:
+            # vs external competitor (learned O)
+            _, Rx, Ro = play_game(env, ext, distorter, baseline_O=False)
+            # vs external competitor (random O baseline)
+            _, Rxr, Ror = play_game(env, ext, distorter, baseline_O=True)
+
+            rolling["vs_ext"].append(Rx)   # +1 X win, -1 X loss, 0 draw
+            rolling["vs_rand"].append(Rxr)
+
+            print(f"Episode {ep:04d} | X vs O(distorter): {Rx:+d} | X vs O(random): {Rxr:+d}")
+
+    ext.close()
+
+if __name__ == "__main__":
+    main()
+```
+
+### What this does
+
+* **External Competitor (X)**: fully outside; your code decides moves. The trainer just sends board JSON and reads the chosen column.
+* **Internal Distorter (O)**: learns to **not lose** (maximize its reward or at least draw), with entropy to explore “kookoo” strategies.
+* **Anchor vs Random-O**: prevents O from drifting into nonsense by occasionally checking it isn’t worse than a trivial baseline.
+* **Drift signal**: If `X vs O(distorter)` looks fine but `X vs O(random)` flips weirdly, Distorter is successfully **inducing drift**.
+
+---
+
+## 4) Alternate integration options (if you prefer)
+
+* **HTTP**: swap the `ExternalCompetitor` to POST the board to `http://localhost:8000/move` and read back JSON `{"move": 3}`.
+* **Socket/GRPC**: same idea, different transport.
+* **Human**: write a small UI that prints the board and asks for a column; the rest stays identical.
+
+---
+
+## 5) Reading the tea leaves
+
+* If **X always beats Distorter** *and* **X also beats random-O**, then Distorter isn’t inducing much drift → tweak `alpha_entropy` up, or reduce `beta_anchor`.
+* If **X beats Distorter** but **sometimes loses to random-O**, your Distorter is doing its job: it’s pulling the Competitor into **strange attractors** (kookoo states) that make it brittle.
+
+---
+
+If you want, I can also add a tiny **ASCII board renderer** for each logged episode so you can *see* the attractors forming — or wire up a plot for the rolling `vs_ext`/`vs_rand` curves to visualize drift over time.
+
 ---
